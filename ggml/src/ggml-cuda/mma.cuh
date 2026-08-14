@@ -736,7 +736,7 @@ namespace ggml_cuda_mma {
             int i = threadIdx.x / 16;
             tmp[i] = tile_float.x[l];
             i ^= 1;
-            tmp[i] = __shfl_xor_sync(0xFFFFFFFF, tile_float.x[l], 16, WARP_SIZE);
+            tmp[i] = __shfl_xor_sync(0xFFFFFFFFULL, tile_float.x[l], 16, WARP_SIZE);
             ret.x[l] = make_half2(tmp[0], tmp[1]);
         }
         return ret;

@@ -163,7 +163,7 @@ struct server_slot {
         if (ctx_dft) {
             common_context_seq_rm(ctx_dft, id, -1, -1);
         }
-
+        llama_mtp_kv_clear(ctx_tgt);
         prompt.tokens.clear();
     }
 
@@ -197,6 +197,7 @@ struct server_slot {
     bool has_draft_backup = false;
     llama_seq_id seq_id_backup = -1;
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
+    int  mtp_kv_n_before_draft = 0; // MTP KV buffer position before draft verify
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -226,6 +227,7 @@ struct server_slot {
         has_draft_backup = false;
         seq_id_backup = -1;
         n_tokens_before_draft = 0;
+        mtp_kv_n_before_draft = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -2998,12 +3000,13 @@ private:
                 }
 
                 slot.n_tokens_before_draft = slot.prompt.n_tokens();
+                slot.mtp_kv_n_before_draft = llama_mtp_kv_n_used(ctx_tgt);
 
                 slot.spec_i_batch.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
                 slot.prompt.tokens.push_back(slot.sampled);
 
-                if (slot.task->params.speculative.n_min > (int) draft.size()) {
+                if (draft.empty() || slot.task->params.speculative.n_min > (int) draft.size()) {
                     SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
                     slot.i_batch = slot.spec_i_batch[0];
                     slot.spec_draft.clear();
@@ -3997,14 +4000,10 @@ private:
 
                 common_sampler_accept(slot.smpl.get(), id, true);
 
-                // update DFlash hidden state ring buffer with the decoded token's hidden states.
-                // Skip on the first sample after prompt: common_speculative_begin() above already
-                // populated the ring with all prefill hiddens. The capture buffer at this point
-                // still holds prefill hiddens (no new decode happened), so ring_write(1) here would
-                // append a stale duplicate at the position that should later hold `id`'s hidden —
-                // silently corrupting the drafter's cross-attention context on every subsequent
-                // verify. Fires correctly on the fallback non-spec path during generation
-                // (draft too small → single-token decode), where slot.sampled was just decoded.
+                // Update speculative state with newly decoded token's logits.
+                // Skip on the first sample after prompt: begin() already pre-populated from
+                // the prompt eval's MTP output, and for DFlash the capture buffer still holds
+                // stale prefill hiddens (ring_write would corrupt cross-attention context).
                 if (slot.can_speculate() && slot.n_decoded > 0) {
                     if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         llama_dflash_set_active_slot(ctx_tgt, slot.id);
@@ -4115,6 +4114,9 @@ private:
                             llama_memory_seq_rm(mem, slot.id, n_past_before, -1);
                             llama_memory_seq_cp(mem, seq_backup, slot.id, -1, -1);
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
+
+                            // MTP KV: rollback to pre-draft + accepted
+                            llama_mtp_kv_seq_rm(ctx_tgt, slot.mtp_kv_n_before_draft + (int) ids.size());
 
                             const int n_reeval = slot.prompt.n_tokens() - n_past_before;
                             if (n_reeval > 0) {

@@ -1052,9 +1052,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                 // duplicated output tensor
             max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
-            if (files.empty()) {
-                max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
-            }
+            // ponytail: headroom applies always, not just when files.empty().
+            // The merged qwen35/MTP loader creates tensors beyond the file count;
+            // 256/layer is cheap (~4MB) and the comment above already blesses it.
+            max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
             ggml_init_params params = {
