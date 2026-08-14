@@ -5,116 +5,13 @@
 #include "log.h"
 #include "llama.h"
 
-#include <algorithm>
 #include <clocale>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
-#include <random>
 #include <string>
 #include <vector>
 #include <utility>
-
-struct spec_checkpoint {
-    int64_t n_tokens = 0;
-
-    std::vector<uint8_t> data;
-
-    size_t size() const {
-        return data.size();
-    }
-
-    bool empty() const {
-        return data.empty();
-    }
-};
-
-// Rejection sampling verification for speculative decoding at temp > 0.
-// Accepts draft token x with probability min(1, p_target(x) / q_draft(x)).
-// On rejection, uses the target's sampled token instead.
-// Returns accepted tokens (at least 1, at most draft.size()+1).
-static std::vector<llama_token> speculative_reject_sample(
-        struct common_sampler * smpl,
-        struct llama_context  * ctx_tgt,
-        const llama_tokens    & draft,
-        const std::vector<float> & draft_log_probs,
-        float                   temp,
-        std::mt19937          & rng) {
-    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
-    const float inv_temp = (temp > 0.0f) ? (1.0f / temp) : 1.0f;
-
-    std::vector<llama_token> result;
-    result.reserve(draft.size() + 1);
-    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-
-    for (size_t i = 0; i < draft.size(); i++) {
-        // sample from target at position i (through the full sampler chain)
-        const llama_token target_token = common_sampler_sample(smpl, ctx_tgt, (int)i);
-
-        if (target_token == draft[i]) {
-            // exact match — always accept
-            common_sampler_accept(smpl, target_token, true);
-            result.push_back(target_token);
-            continue;
-        }
-
-        // extension tokens (beyond draft_log_probs): exact match only
-        if (i >= draft_log_probs.size()) {
-            common_sampler_accept(smpl, target_token, true);
-            result.push_back(target_token);
-            break;
-        }
-
-        // compute target's log-probability for the draft token
-        float * target_logits = llama_get_logits_ith(ctx_tgt, (int)i);
-        if (!target_logits) {
-            // no target logits — fall back to exact match (reject)
-            common_sampler_accept(smpl, target_token, true);
-            result.push_back(target_token);
-            break;
-        }
-
-        // compute log p_target(draft[i]) via single-pass online softmax
-        float lse_max = -INFINITY;
-        float lse_sum = 0.0f;
-        for (int v = 0; v < n_vocab; v++) {
-            float scaled = target_logits[v] * inv_temp;
-            if (scaled > lse_max) {
-                lse_sum = lse_sum * expf(lse_max - scaled) + 1.0f;
-                lse_max = scaled;
-            } else {
-                lse_sum += expf(scaled - lse_max);
-            }
-        }
-        float p_log = target_logits[draft[i]] * inv_temp - lse_max - logf(lse_sum);
-
-        // acceptance probability = min(1, p_target / q_draft) = min(1, exp(p_log - q_log))
-        float q_log = draft_log_probs[i];
-        float accept_prob = expf(p_log - q_log);
-        if (accept_prob > 1.0f) accept_prob = 1.0f;
-
-        if (uniform(rng) < accept_prob) {
-            // accept draft token
-            common_sampler_accept(smpl, draft[i], true);
-            result.push_back(draft[i]);
-        } else {
-            // reject — use target's sample
-            common_sampler_accept(smpl, target_token, true);
-            result.push_back(target_token);
-            break;
-        }
-    }
-
-    // if all draft tokens accepted, sample one more from target
-    if (result.size() == draft.size()) {
-        const llama_token bonus = common_sampler_sample(smpl, ctx_tgt, (int)draft.size());
-        common_sampler_accept(smpl, bonus, true);
-        result.push_back(bonus);
-    }
-
-    return result;
-}
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -132,21 +29,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.speculative.mparams_dft.path.empty() &&
-            params.speculative.draft.mparams.path.empty() &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_MOD &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_CACHE &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_SUFFIX &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_COPYSPEC &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_RECYCLE &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_MTP) {
-        LOG_ERR("%s: --model-draft is required (unless using a model-free --spec-type)\n", __func__);
-        return 1;
-    }
-
     // init llama.cpp
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -155,44 +37,24 @@ int main(int argc, char ** argv) {
 
     llama_context * ctx_tgt = NULL;
 
-    // speculative decoding with recurrent/hybrid models needs seq_backup=1 for state rollback
-    {
-        if (params.n_parallel < 2) {
-            params.n_parallel = 2;
-        }
-    }
-
     // load the target model
     auto llama_init_tgt = common_init_from_params(params);
 
     model_tgt = llama_init_tgt->model();
     ctx_tgt   = llama_init_tgt->context();
 
-    // check if the context supports partial sequence removal
-    const auto ctx_seq_rm = common_context_can_seq_rm(ctx_tgt);
-    const bool use_ckpt = (ctx_seq_rm == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
-
-    if (use_ckpt) {
-        LOG_INF("speculative decoding will use checkpoints (context does not support partial sequence removal)\n");
-    }
-
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
 
-    // load the draft model (skip for model-free spec types)
+    // load the draft model
     llama_model_ptr model_dft;
+    llama_context_ptr ctx_dft;
 
-    if (!params.speculative.mparams_dft.path.empty() || !params.speculative.draft.mparams.path.empty()) {
+    // TODO: simplify this logic
+    {
         const auto & params_spec = params.speculative.draft;
 
         auto params_dft = params;
 
-        params_dft.n_parallel   = 1;
-        // DFlash drafter uses sliding window (ctx_window=512) at runtime.
-        // n_ctx only affects graph reservation size; 256 keeps compute buffer small.
-        params_dft.n_ctx        = params_spec.n_ctx > 0 ? params_spec.n_ctx : 256;
-        // drafter only processes block_size tokens per call — keep batch small to save VRAM
-        params_dft.n_batch      = std::min((int32_t)64, params_dft.n_ctx);
-        params_dft.n_ubatch     = params_dft.n_batch;
         params_dft.devices      = params_spec.devices;
         params_dft.model        = params_spec.mparams;
         params_dft.n_gpu_layers = params_spec.n_gpu_layers;
@@ -212,22 +74,19 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        params.speculative.model_dft = model_dft.get();
-        params.speculative.cparams_dft = common_context_params_to_llama(params_dft);
-        params.speculative.draft.model = model_dft.get();
-        params.speculative.draft.cparams = common_context_params_to_llama(params_dft);
+        auto cparams = common_context_params_to_llama(params_dft);
+        ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
-        // Auto-detect DFlash from model architecture
-        if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
-            LOG_INF("auto-detected DFlash drafter (block_size=%d)\n", llama_model_dflash_block_size(model_dft.get()));
-        }
+        params.speculative.draft.ctx_tgt = ctx_tgt;
+        params.speculative.draft.ctx_dft = ctx_dft.get();
+    }
 
-        // DFlash: share tok_embd/output from target BEFORE creating drafter context
-        if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-            llama_model_share_tensors(model_dft.get(), model_tgt);
-        }
+    // check if the context supports partial sequence removal
+    const bool use_ckpt_tgt = (common_context_can_seq_rm(ctx_tgt)       == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+    const bool use_ckpt_dft = (common_context_can_seq_rm(ctx_dft.get()) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+
+    if (use_ckpt_tgt) {
+        LOG_INF("speculative decoding will use checkpoints (context does not support partial sequence removal)\n");
     }
 
     // Tokenize the prompt
@@ -256,18 +115,10 @@ int main(int argc, char ** argv) {
     int n_drafted = 0;
     int n_accept  = 0;
 
-    // per-position rejection histogram: reject_pos[i] = how many times position i caused rejection
-    // position 0 = first draft token, position N-1 = last. "all_accepted" counted separately.
-    std::vector<int> reject_pos(16, 0);
-    int n_all_accepted = 0;
-
     // used to determine end of generation
     bool has_eos = false;
 
-    // hybrid models with recurrent layers need state management after partial rejection
-    const bool needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
-    // backup sequence ID for saving recurrent state before speculative batches
-    const llama_seq_id seq_backup = 1;
+    llama_seq_id seq_id = 0;
 
     // ================================================
     // everything until here is standard initialization
@@ -278,17 +129,9 @@ int main(int argc, char ** argv) {
     // target model sampling context
     common_sampler_ptr smpl(common_sampler_init(model_tgt, params.sampling));
 
-    // init the speculator BEFORE prefill so DFlash can configure hidden state capture
-    // enable Gumbel sampling for DFlash drafter when target uses temp > 0
-    if (params.sampling.temp > 0.0f && params.speculative.sample_temp == 0.0f) {
-        params.speculative.sample_temp = params.sampling.temp;
-    }
-    const auto & params_spec = params.speculative;
-
-    struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
-
-    // eval the prompt (with hidden state capture if DFlash is active)
-    llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
+    // eval the prompt
+    llama_decode(ctx_tgt,       llama_batch_get_one(inp.data(), inp.size() - 1));
+    llama_decode(ctx_dft.get(), llama_batch_get_one(inp.data(), inp.size() - 1));
 
     // note: keep the last token separate!
     llama_token id_last = inp.back();
@@ -299,321 +142,137 @@ int main(int argc, char ** argv) {
 
     int n_past = inp.size() - 1;
 
-    common_speculative_begin(spec, prompt_tgt);
+    // init the speculator
+    const auto & params_spec = params.speculative;
+
+    struct common_speculative * spec = common_speculative_init(params.speculative, 1);
+
+    common_speculative_begin(spec, seq_id, prompt_tgt);
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
     size_t n_draft = 0;
 
     llama_tokens draft;
-    spec_checkpoint spec_ckpt;
+    common_prompt_checkpoint ckpt;
 
     const auto t_enc_end = ggml_time_us();
 
     const auto t_dec_start = ggml_time_us();
 
-    // timing accumulators (microseconds)
-    int64_t t_draft_total   = 0;  // suffix tree draft generation
-    int64_t t_backup_total  = 0;  // copy_cell backup
-    int64_t t_decode1_total = 0;  // main verification decode
-    int64_t t_sample_total  = 0;  // sampling
-    int64_t t_restore_total = 0;  // seq_rm + seq_cp restore
-    int64_t t_decode2_total = 0;  // re-evaluation decode
-    int64_t t_other_total   = 0;  // everything else (token output, bookkeeping)
-    int     n_iters         = 0;
-    int     n_reeval_tokens = 0;  // total tokens re-evaluated
-    int     n_reeval_calls  = 0;  // number of re-eval decode calls
-    int     n_reeval_skipped = 0; // iterations where all drafts accepted (no re-eval needed)
-
-    const int tree_budget = params_spec.tree_budget;
-
-    // rejection sampling for temp > 0: enable when drafter provides log-probs
-    const float sample_temp = params.sampling.temp;
-    const bool use_rejection_sampling = (sample_temp > 0.0f && params_spec.sample_temp > 0.0f);
-    std::mt19937 reject_rng(params.sampling.seed != 0 ? params.sampling.seed : 42);
-
-    std::vector<float> draft_log_probs;
-    if (use_rejection_sampling) {
-        draft_log_probs.reserve(params_spec.n_max);
-        LOG_INF("rejection sampling enabled (temp=%.2f)\n", sample_temp);
-    }
-
-
     while (true) {
-        n_iters++;
+        // generate or reuse draft tokens
+        //
+        // this is the most important part of the speculation. the more probable tokens that are provided here
+        // the better the performance will be. in theory, this computation can be performed asynchronously and even
+        // offloaded to a remote device. it doesn't even have to be based on an LLM. instead, it can provide tokens
+        // from a cache or lookup tables.
+        //
+        if (draft.empty()) {
+            ckpt.update_pos(
+                    prompt_tgt.size(),
+                    llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), seq_id),
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id));
 
-        llama_tokens ids;
-        common_sampler_ptr smpl_save;
-        int n_draft_this_iter = 0;
-        int main_path_len = 0;
-        bool has_backup = false;
-        bool accepted_on_main_path = true;
-        common_speculative_tree tree;
-        int commit_n = 0;
-        std::vector<int32_t> linear_parents;
-
-        if (tree_budget > 0) {
-            // === DDTree path: single-pass tree-structured speculative decoding ===
-            {
-                common_time_meas tm(t_draft_total);
-                tree = common_speculative_draft_tree(spec, params_spec, prompt_tgt, id_last, tree_budget);
+            if (use_ckpt_dft) {
+                ckpt.update_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
             }
 
-            common_batch_clear(batch_tgt);
+            // generate a new draft
+            common_speculative_get_draft_params(spec, seq_id) = {
+                /* .drafting   = */ true,
+                /* .n_max      = */ -1,
+                /* .n_past     = */ n_past,
+                /* .id_last    = */ id_last,
+                /* .prompt     = */ &prompt_tgt,
+                /* .result     = */ &draft, // output
+            };
+            common_speculative_draft(spec);
 
-            if (tree.n_nodes == 0) {
-                // no tree nodes — single token decode (same as empty draft)
-                common_batch_add(batch_tgt, id_last, n_past++, {0}, true);
-                {
-                    common_time_meas tm(t_decode1_total);
-                    llama_decode(ctx_tgt, batch_tgt);
+            // save the original draft size
+            n_draft = draft.size();
+
+            // save a checkpoint of the target context before evaluating the draft
+            // this allows us to restore the state if partial draft acceptance occurs
+            if (!draft.empty()) {
+                if (use_ckpt_tgt) {
+                    ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
                 }
-                {
-                    llama_tokens batch_tokens = { id_last };
-                    common_speculative_update_logits(spec, ctx_tgt, batch_tokens, 1);
-                }
-                {
-                    common_time_meas tm(t_sample_total);
-                    llama_token t = common_sampler_sample(smpl.get(), ctx_tgt, 0);
-                    common_sampler_accept(smpl.get(), t, true);
-                    ids.push_back(t);
-                }
-            } else {
-                // Single-pass tree verify: batch ALL tree nodes with tree mask + parent_ids
-                // All tokens on seq_id=0 so ubatch allocator keeps them together for GDN kernel.
-                // KV cleanup uses backup-restore path (branches share positions with main chain).
-                common_batch_add(batch_tgt, id_last, n_past++, {0}, true);
-                for (int i = 0; i < tree.n_nodes; ++i) {
-                    common_batch_add(batch_tgt, tree.tokens[i], n_past - 1 + tree.depths[i], {0}, true);
-                }
+            }
 
-                n_draft_this_iter = tree.n_nodes;
-                main_path_len = tree.main_path_len;
+            {
+                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
-                if (needs_reeval) {
-                    llama_tape_replay_sync(ctx_tgt); // ensure previous async replay is done
-                    common_time_meas tm(t_backup_total);
-                    auto * mem = llama_get_memory(ctx_tgt);
-                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                    llama_memory_seq_cp(mem, 0, seq_backup, -1, -1);
-                    has_backup = true;
-                }
-
-                // Set tree mask (attention layers) + parent_ids (tree-aware SSM kernel)
-                llama_set_tree_mask(ctx_tgt, tree.visibility.data(), tree.n_nodes + 1);
-                llama_set_tree_parent_ids(ctx_tgt, tree.parents.data(), tree.n_nodes + 1);
-
-                // Enable tape recording for conv state rollback
-                if (needs_reeval) {
-                    llama_set_tape_recording(ctx_tgt, true);
-                }
-                {
-                    common_time_meas tm(t_decode1_total);
-                    llama_decode(ctx_tgt, batch_tgt);
-                }
-                if (needs_reeval) {
-                    llama_set_tape_recording(ctx_tgt, false);
-                }
-
-                llama_clear_tree_mask(ctx_tgt);
-
-                LOG_DBG("[iter %d] tree decode: n_nodes=%d, n_past=%d\n", n_iters, tree.n_nodes, n_past);
-
-                // MTP branch enrichment: add conditional next-next-token candidates
-                int n_mtp_branches = 0;
-                {
-                    int64_t mtp_vocab = llama_get_mtp_n_vocab(ctx_tgt);
-                    if (mtp_vocab > 0 && tree.main_path_len > 0) {
-                        for (int i = 0; i < tree.main_path_len; ++i) {
-                            float * mtp_logits = llama_get_mtp_logits_ith(ctx_tgt, i);
-                            if (!mtp_logits) continue;
-
-                            int parent_node = i + 1;
-                            int child_depth = i + 2;
-
-                            llama_token mtp_token = (llama_token)(std::max_element(mtp_logits, mtp_logits + mtp_vocab) - mtp_logits);
-
-                            if (tree.child_maps[parent_node].count(mtp_token)) continue;
-
-                            int new_idx = tree.n_nodes + 1;
-                            tree.tokens.push_back(mtp_token);
-                            tree.parents.push_back(parent_node);
-                            tree.depths.push_back(child_depth);
-                            tree.child_maps.push_back({});
-                            tree.child_maps[parent_node][mtp_token] = new_idx;
-                            tree.n_nodes++;
-                            n_mtp_branches++;
-                        }
-                    }
-                }
-                n_draft_this_iter += n_mtp_branches;
-                if (n_mtp_branches > 0) {
-                    LOG_INF("mtp_branches: added %d branches to tree (%d total nodes)\n",
-                            n_mtp_branches, tree.n_nodes);
-                }
-
-                // Tree walk: all logits available from single pass
-                {
-                    int current = 0;
-
-                    while (true) {
-                        llama_token target_token;
-                        {
-                            common_time_meas tm_s(t_sample_total);
-                            target_token = common_sampler_sample(smpl.get(), ctx_tgt, current);
-                            common_sampler_accept(smpl.get(), target_token, true);
-                            ids.push_back(target_token);
-                        }
-
-                        auto it = tree.child_maps[current].find(target_token);
-                        if (it == tree.child_maps[current].end()) {
-                            break; // mismatch = bonus token
-                        }
-
-                        int next = it->second;
-                        current = next;
-                        commit_n = next;
-
-                        if (next > tree.main_path_len) {
-                            accepted_on_main_path = false;
-                        }
-                    }
-                }
-
-                // Update drafter hidden states with accepted path tokens
-                {
-                    llama_tokens accepted_tokens;
-                    accepted_tokens.push_back(id_last);
-                    // Walk accepted path to collect tokens
-                    int node = commit_n;
-                    std::vector<int> path;
-                    while (node > 0) {
-                        path.push_back(node);
-                        node = tree.parents[node];
-                    }
-                    std::reverse(path.begin(), path.end());
-                    for (int idx : path) {
-                        accepted_tokens.push_back(tree.tokens[idx - 1]);
-                    }
-                    common_speculative_update_logits(spec, ctx_tgt, accepted_tokens, (int)ids.size());
-                }
+                llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
             }
         } else {
-            // === Flat path: linear speculative decoding ===
-            if (draft.empty()) {
-                draft_log_probs.clear();
-                {
-                    common_time_meas tm(t_draft_total);
-                    draft = common_speculative_draft(spec, params_spec, prompt_tgt, id_last,
-                        use_rejection_sampling ? &draft_log_probs : nullptr);
-                }
+            // we have a previous (partial) draft to reuse from checkpoint restoration
+            if (use_ckpt_tgt) {
+                GGML_ASSERT(!ckpt.empty());
+            }
+        }
 
-                // save the original draft size
-                n_draft = draft.size();
+        // always have a token to evaluate from before - id_last
+        common_batch_clear(batch_tgt);
+        common_batch_add  (batch_tgt, id_last, n_past++, { seq_id }, true);
 
-                // save a checkpoint of the target context before evaluating the draft
-                if (!draft.empty() && use_ckpt) {
-                    const size_t ckpt_size = llama_state_seq_get_size_ext(ctx_tgt, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    spec_ckpt.data.resize(ckpt_size);
-
-                    const size_t n = llama_state_seq_get_data_ext(ctx_tgt, spec_ckpt.data.data(), ckpt_size, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    GGML_ASSERT(n == ckpt_size);
-
-                    spec_ckpt.n_tokens = (int64_t) prompt_tgt.size();
-                    LOG_DBG("created speculative checkpoint (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                            spec_ckpt.n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
-                }
-            } else {
-                // we have a previous (partial) draft to reuse from checkpoint restoration
-                if (use_ckpt) {
-                    GGML_ASSERT(!spec_ckpt.empty());
-                }
+        // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
+        {
+            for (size_t i = 0; i < draft.size(); ++i) {
+                common_batch_add(batch_tgt, draft[i], n_past + i, { seq_id }, true);
             }
 
-            common_batch_clear(batch_tgt);
-            common_batch_add  (batch_tgt, id_last, n_past++, { 0 }, true);
+            //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
-            {
-                if (draft.size() < (size_t) params_spec.n_min) {
-                    draft.clear();
-                }
+            llama_decode(ctx_tgt, batch_tgt);
+        }
 
-                for (size_t i = 0; i < draft.size(); ++i) {
-                    common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
-                }
+        // evaluate the same batch with the draft model
+        {
+            // TODO: extend to support MTP, Eagle, etc. See server code for reference
+            llama_decode(ctx_dft.get(), batch_tgt);
+        }
 
-                // Set linear parent_ids to trigger tree kernel (stores intermediates for fast rollback)
-                if (needs_reeval && !draft.empty()) {
-                    llama_tape_replay_sync(ctx_tgt); // ensure previous async replay is done
-                    const int n_batch_tokens = 1 + (int)draft.size();
-                    linear_parents.resize(n_batch_tokens);
-                    linear_parents[0] = -1; // root loads initial state
-                    for (int i = 1; i < n_batch_tokens; i++) {
-                        linear_parents[i] = i - 1;
-                    }
-                    llama_set_tree_parent_ids(ctx_tgt, linear_parents.data(), n_batch_tokens);
+        // only save the sampler sampler state if we use checkpoints
+        common_sampler_ptr smpl_save;
+        if (use_ckpt_tgt) {
+            smpl_save.reset(common_sampler_clone(smpl.get()));
+        }
 
-                    // Take backup for rollback
-                    auto * mem = llama_get_memory(ctx_tgt);
-                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                    llama_memory_seq_cp(mem, 0, seq_backup, -1, -1);
-                    has_backup = true;
-                }
+        // sample from the full target batch and return the accepted tokens based on the target sampler
+        //
+        // for each token to be accepted, the sampler would have to sample that same token
+        // in such cases, instead of decoding the sampled token as we normally do, we simply continue with the
+        // available logits from the batch and sample the next token until we run out of logits or the sampler
+        // disagrees with the draft
+        //
+        auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
 
-                // Enable tape recording so GPU tape captures k/v/g/b for tape_replay
-                if (needs_reeval && !draft.empty()) {
-                    llama_set_tape_recording(ctx_tgt, true);
-                }
-                {
-                    common_time_meas tm(t_decode1_total);
-                    llama_decode(ctx_tgt, batch_tgt);
-                }
-                if (needs_reeval && !draft.empty()) {
-                    llama_set_tape_recording(ctx_tgt, false);
-                }
-            }
-
-            // save sampler state before sampling if we use checkpoints
-            if (use_ckpt) {
-                smpl_save.reset(common_sampler_clone(smpl.get()));
-            }
-
-            {
-                common_time_meas tm(t_sample_total);
-                if (use_rejection_sampling && !draft_log_probs.empty()) {
-                    ids = speculative_reject_sample(smpl.get(), ctx_tgt, draft, draft_log_probs,
-                        sample_temp, reject_rng);
-                } else {
-                    ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
-                }
-            }
-
-            n_draft_this_iter = (int)draft.size();
-
-            // update draft strategies with logits (e.g. token recycling adjacency matrix)
-            {
-                llama_tokens batch_tokens;
-                batch_tokens.push_back(id_last);
-                batch_tokens.insert(batch_tokens.end(), draft.begin(), draft.end());
-                common_speculative_update_logits(spec, ctx_tgt, batch_tokens, (int)ids.size());
-            }
-
-        } // end flat path
+        //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
         GGML_ASSERT(ids.size() > 0);
 
-        // check for partial draft acceptance
-        if (use_ckpt && ids.size() - 1 < draft.size()) {
+        // check for partial draft acceptance:
+        // if the context doesn't support partial sequence removal, restore the checkpoint
+        // and make the accepted tokens the new partial draft for the next iteration
+        if (use_ckpt_tgt && ids.size() - 1 < draft.size()) {
             LOG_DBG("partial acceptance: %zu < %zu, restoring checkpoint\n", ids.size() - 1, draft.size());
 
             draft = std::move(ids);
 
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, spec_ckpt.data.data(), spec_ckpt.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            GGML_ASSERT(n == spec_ckpt.size());
+            {
+                ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, spec_ckpt.n_tokens, -1);
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
+            }
 
-            prompt_tgt.resize(spec_ckpt.n_tokens);
+            {
+                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+
+                llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
+            }
+
+            prompt_tgt.resize(ckpt.n_tokens);
             smpl = std::move(smpl_save);
 
             n_past = (int) prompt_tgt.size();
@@ -621,131 +280,50 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        common_speculative_accept(spec, ids.size() - 1);
+        if (n_draft > 0) {
+            common_speculative_accept(spec, seq_id, ids.size() - 1);
+        }
 
         // full acceptance: consume the draft and commit accepted tokens
         n_past    += ids.size() - 1;
-        n_drafted += n_draft_this_iter;
+        n_drafted += n_draft; // note: we ignore the discarded small drafts
         n_accept  += ids.size() - 1;
         n_predict += ids.size();
 
-        // track rejection position
-        if (n_draft_this_iter > 0) {
-            if ((int)ids.size() == n_draft_this_iter + 1) {
-                n_all_accepted++;
+        // process the accepted tokens and update contexts
+        //
+        // this is the standard token post-processing that we normally do
+        // in this case, we do it for a group of accepted tokens at once
+        //
+        for (size_t i = 0; i < ids.size(); ++i) {
+            prompt_tgt.push_back(id_last);
+
+            id_last = ids[i];
+
+            if (llama_vocab_is_eog(vocab, id_last)) {
+                has_eos = true;
+                break;
+            }
+
+            const std::string token_str = common_token_to_piece(ctx_tgt, id_last);
+
+            if (params.use_color && i + 1 < ids.size()) {
+                LOG("\u001b[%dm%s\u001b[37m", (36 - 0 % 6), token_str.c_str());
             } else {
-                int rej_pos = (int)ids.size() - 1;
-                if (rej_pos < (int)reject_pos.size()) {
-                    reject_pos[rej_pos]++;
-                }
-            }
-
-        }
-
-        {
-            common_time_meas tm(t_other_total);
-            for (size_t i = 0; i < ids.size(); ++i) {
-                prompt_tgt.push_back(id_last);
-
-                id_last = ids[i];
-
-                if (llama_vocab_is_eog(vocab, id_last)) {
-                    has_eos = true;
-                    break;
-                }
-
-                const std::string token_str = common_token_to_piece(ctx_tgt, id_last);
-
-                if (params.use_color && i + 1 < ids.size()) {
-                    LOG("\u001b[%dm%s\u001b[37m", (36 - 0 % 6), token_str.c_str());
-                } else {
-                    LOG("%s", token_str.c_str());
-                }
+                LOG("%s", token_str.c_str());
             }
         }
 
-        LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, n_draft_this_iter, id_last);
+        LOG_DBG("accepted %d/%d draft tokens, the last target token is: (%d)\n", (int) ids.size() - 1, (int) draft.size(), id_last);
 
         // clear the draft since it has been consumed
         draft.clear();
 
-        if (has_backup && !has_eos) {
-            if (tree_budget > 0) {
-                // DDTree rollback: tree_rollback for SSM state, backup-restore for KV cache
-                const int n_past_before = n_past - (int)ids.size();
-                auto * mem = llama_get_memory(ctx_tgt);
-
-                // tree_rollback: restore SSM state from f16 intermediates + conv from tape
-                // Target pos = n_past_before + depth of committed node
-                const int commit_depth = (commit_n > 0) ? tree.depths[commit_n - 1] : 0;
-                {
-                    common_time_meas tm(t_restore_total);
-                    llama_tree_rollback(ctx_tgt, commit_n, tree.parents.data(), n_past_before + commit_depth);
-                }
-
-                // KV cache cleanup
-                {
-                    common_time_meas tm(t_decode2_total);
-                    const int n_branches = tree.n_nodes - tree.main_path_len;
-                    const bool all_accepted = (commit_depth == tree.main_path_len);
-
-                    if (n_branches == 0 && accepted_on_main_path) {
-                        // Fast path: no branches, just trim rejected tail from KV
-                        if (!all_accepted) {
-                            llama_memory_seq_rm(mem, 0, n_past_before + commit_depth + 1, -1);
-                        }
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                        n_reeval_skipped++;
-                    } else {
-                        // Slow path: branches create position collisions on seq 0.
-                        // Backup-restore + re-decode accepted tokens.
-                        llama_memory_seq_rm(mem, 0, n_past_before, -1);
-                        llama_memory_seq_cp(mem, seq_backup, 0, -1, -1);
-                        llama_memory_seq_rm(mem, seq_backup, -1, -1);
-
-                        // Re-decode accepted tokens for KV
-                        common_batch_clear(batch_tgt);
-                        for (int i = n_past_before; i < (int)prompt_tgt.size(); ++i) {
-                            common_batch_add(batch_tgt, prompt_tgt[i], i, { 0 }, false);
-                        }
-                        if (batch_tgt.n_tokens > 0) {
-                            llama_decode(ctx_tgt, batch_tgt);
-                            n_reeval_tokens += batch_tgt.n_tokens;
-                            n_reeval_calls++;
-                        }
-                    }
-                }
-                n_past = (int)prompt_tgt.size();
-            } else {
-                // Flat path rollback: tree_rollback (GPU intermediates) for SSM + conv state
-                const bool all_accepted = ((int)ids.size() == n_draft_this_iter + 1);
-
-                if (all_accepted) {
-                    llama_clear_tree_parent_ids(ctx_tgt);
-                    auto * mem = llama_get_memory(ctx_tgt);
-                    llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                    llama_memory_seq_rm(mem, 0, n_past, -1);
-                    n_reeval_skipped++;
-                } else {
-                    const int n_past_before = n_past - (int)ids.size();
-
-                    llama_clear_tree_parent_ids(ctx_tgt);
-
-                    {
-                        common_time_meas tm(t_decode2_total);
-                        llama_dflash_rollback(ctx_tgt, 0, seq_backup, n_past_before, (int)ids.size());
-                    }
-
-                    n_reeval_tokens += (int)ids.size();
-                    n_reeval_calls++;
-                    n_past = (int)prompt_tgt.size();
-                }
-            }
-        } else {
+        {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
-            // Clear stale parent_ids if no rollback happened
-            llama_clear_tree_parent_ids(ctx_tgt);
+
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt),       seq_id, n_past, -1);
+            llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, n_past, -1);
         }
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
@@ -754,23 +332,6 @@ int main(int argc, char ** argv) {
     }
 
     auto t_dec_end = ggml_time_us();
-
-    const int64_t t_dec_total = t_dec_end - t_dec_start;
-    const int64_t t_accounted = t_draft_total + t_backup_total + t_decode1_total + t_sample_total + t_restore_total + t_decode2_total + t_other_total;
-
-    LOG_INF("\n");
-    LOG_INF("=== SPECULATIVE LOOP TIMING BREAKDOWN ===\n");
-    LOG_INF("iterations:     %d\n", n_iters);
-    LOG_INF("total decode:   %8.2f ms (100%%)\n", t_dec_total / 1e3);
-    LOG_INF("  draft gen:    %8.2f ms (%5.1f%%)\n", t_draft_total / 1e3,   100.0 * t_draft_total / t_dec_total);
-    LOG_INF("  backup:       %8.2f ms (%5.1f%%)\n", t_backup_total / 1e3,  100.0 * t_backup_total / t_dec_total);
-    LOG_INF("  decode1 (verify): %8.2f ms (%5.1f%%)  [%d tok/call avg]\n", t_decode1_total / 1e3, 100.0 * t_decode1_total / t_dec_total, n_iters > 0 ? (int)(n_predict + n_drafted) / n_iters : 0);
-    LOG_INF("  sampling:     %8.2f ms (%5.1f%%)\n", t_sample_total / 1e3,  100.0 * t_sample_total / t_dec_total);
-    LOG_INF("  restore:      %8.2f ms (%5.1f%%)\n", t_restore_total / 1e3, 100.0 * t_restore_total / t_dec_total);
-    LOG_INF("  decode2 (reeval): %8.2f ms (%5.1f%%)  [%d calls, %d tok total, %.1f tok/call avg, %d skipped (all-accept)]\n", t_decode2_total / 1e3, 100.0 * t_decode2_total / t_dec_total, n_reeval_calls, n_reeval_tokens, n_reeval_calls > 0 ? (float)n_reeval_tokens / n_reeval_calls : 0.0f, n_reeval_skipped);
-    LOG_INF("  other:        %8.2f ms (%5.1f%%)\n", t_other_total / 1e3,   100.0 * t_other_total / t_dec_total);
-    LOG_INF("  unaccounted:  %8.2f ms (%5.1f%%)\n", (t_dec_total - t_accounted) / 1e3, 100.0 * (t_dec_total - t_accounted) / t_dec_total);
-    LOG_INF("=========================================\n");
 
     const int n_input = inp.size();
 
@@ -785,26 +346,9 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
-    // per-position rejection histogram
-    {
-        int n_rounds_with_draft = n_all_accepted;
-        for (int i = 0; i < (int)reject_pos.size(); ++i) {
-            n_rounds_with_draft += reject_pos[i];
-        }
-        if (n_rounds_with_draft > 0) {
-            LOG_INF("\nrejection histogram (position → count [%%]):\n");
-            for (int i = 0; i < (int)reject_pos.size() && i < params_spec.n_max; ++i) {
-                if (reject_pos[i] > 0) {
-                    LOG_INF("  pos %2d: %4d (%5.1f%%)\n", i, reject_pos[i], 100.0f * reject_pos[i] / n_rounds_with_draft);
-                }
-            }
-            LOG_INF("  all ok: %4d (%5.1f%%)\n", n_all_accepted, 100.0f * n_all_accepted / n_rounds_with_draft);
-        }
-    }
 
     LOG_INF("\n");
     LOG_INF("draft:\n\n");
-    common_speculative_print_stats(spec);
 
     LOG_INF("\n");
     LOG_INF("target:\n\n");

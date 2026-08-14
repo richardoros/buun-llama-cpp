@@ -1,8 +1,57 @@
 #include "models.h"
 
-llm_build_dream::llm_build_dream(const llama_model & model, const llm_graph_params & params) :
+void llama_model_dream::load_arch_hparams(llama_model_loader & ml) {
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    switch (hparams.n_layer) {
+        case 26: type = LLM_TYPE_3B;  break;
+        case 28: type = LLM_TYPE_7B;  break;
+        case 34: type = LLM_TYPE_8B;  break;
+        case 40: type = LLM_TYPE_14B; break;
+        default: type = LLM_TYPE_UNKNOWN;
+    }
+    hparams.causal_attn = false;
+}
+
+void llama_model_dream::load_arch_tensors(llama_model_loader &) {
+    LLAMA_LOAD_LOCALS;
+
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+    // output
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    output_b    = create_tensor(tn(LLM_TENSOR_OUTPUT,      "bias"),   {n_vocab}, TENSOR_NOT_REQUIRED);
+    // if output is NULL, init from the input tok embed
+    if (output == NULL) {
+        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+    }
+
+    for (int i = 0; i < n_layer; ++i) {
+        auto & layer = layers[i];
+
+        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+        create_tensor_qkv(layer, i, n_embd, n_embd_head_k*n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k*n_head, n_embd}, 0);
+
+        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+    }
+}
+
+std::unique_ptr<llm_graph_context> llama_model_dream::build_arch_graph(const llm_graph_params & params) const {
+    if (params.mctx) {
+        return std::make_unique<graph<true>>(*this, params);
+    }
+    return std::make_unique<graph<false>>(*this, params);
+}
+
+template <bool use_cache>
+llama_model_dream::graph<use_cache>::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
-    //copied from qwen2
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -13,21 +62,25 @@ llm_build_dream::llm_build_dream(const llama_model & model, const llm_graph_para
 
     inpL = build_inp_embd(model.tok_embd);
 
-    // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn = build_attn_inp_no_cache();
+    using inp_attn_type = std::conditional_t<use_cache, llm_graph_input_attn_kv, llm_graph_input_attn_no_cache>;
+
+    inp_attn_type * inp_attn = nullptr;
+    if constexpr (use_cache) {
+        inp_attn = build_attn_inp_kv();
+    } else {
+        inp_attn = build_attn_inp_no_cache();
+    }
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
-        // norm
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        // self-attention
         {
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
@@ -53,7 +106,6 @@ llm_build_dream::llm_build_dream(const llama_model & model, const llm_graph_para
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        // feed-forward network
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
@@ -69,7 +121,6 @@ llm_build_dream::llm_build_dream(const llama_model & model, const llm_graph_para
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
-        // input for next layer
         inpL = cur;
     }
     cur = inpL;
@@ -79,8 +130,7 @@ llm_build_dream::llm_build_dream(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur);
+    cur = build_lora_mm(model.output, cur, model.output_s);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

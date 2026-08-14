@@ -23,6 +23,7 @@ public:
                          bool   offload,
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
+                     uint32_t   n_rs_seq,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -75,6 +76,14 @@ public:
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
+    uint32_t n_rs_seq = 0;
+
+    // per-seq rollback index
+    std::vector<uint32_t> rs_idx;
+
+    void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build
     uint32_t n = 0;
@@ -172,6 +181,11 @@ public:
     ggml_tensor * get_s_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // True when the state input for the first n_seqs cells is a contiguous identity gather
+    // (src0 == head + i for all i, no extra states), so build_rs can return a plain view of
+    // the state slot instead of materializing a get_rows copy. Pure: no side effects.
+    bool states_are_contiguous_identity(uint32_t n_seqs) const;
 
 private:
     const llama_memory_status status;

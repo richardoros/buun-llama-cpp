@@ -76,6 +76,79 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 #endif // !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
     }
 
+    // Set TCQ constants in THIS compilation unit's __constant__ memory before kernel launch.
+    // Each template instance .cu file has its own static __constant__ copies.
+    if constexpr (type_K == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO3_TCQ) {
+        static bool cb3_loaded = false;
+        if (!cb3_loaded) {
+            cb3_loaded = true;
+            const char * cb_path = getenv("TURBO_TCQ_CB");
+            if (cb_path) {
+                float cb[512];
+                FILE * f = fopen(cb_path, "rb");
+                if (f && fread(cb, sizeof(float), 512, f) == 512) {
+                    fclose(f);
+                    CUDA_CHECK(cudaMemcpyToSymbol(d_turbo3_tcq_codebook_fattn, cb, 512 * sizeof(float)));
+                } else { if (f) fclose(f); }
+            }
+        }
+    }
+    if constexpr (type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ) {
+        static bool cb2_loaded = false;
+        if (!cb2_loaded) {
+            cb2_loaded = true;
+            const char * cb_path = getenv("TURBO_TCQ_CB2");
+            if (cb_path) {
+                float cb[256];
+                FILE * f = fopen(cb_path, "rb");
+                if (f && fread(cb, sizeof(float), 256, f) == 256) {
+                    fclose(f);
+                    CUDA_CHECK(cudaMemcpyToSymbol(d_turbo2_tcq_codebook_fattn, cb, 256 * sizeof(float)));
+                } else { if (f) fclose(f); }
+            }
+        }
+    }
+    if constexpr (type_K == GGML_TYPE_TURBO3_TCQ || type_K == GGML_TYPE_TURBO2_TCQ ||
+                  type_V == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO2_TCQ) {
+        const ggml_tensor * V = dst->src[2];
+        const int64_t n_kv = V->ne[1] > 0 ? V->ne[1] : 1;
+        const float ln_ctx = logf((float)n_kv);
+
+        // V alpha: context-adaptive unless env var override
+        float alpha_v = 1.0f;
+        static float alpha_v_static = -1.0f;
+        if (alpha_v_static < 0.0f) {
+            alpha_v_static = 0.0f;
+            const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_V");
+            if (s) {
+                char * end;
+                float a = strtof(s, &end);
+                if (end != s && a > 0.0f && a < 10.0f) alpha_v_static = a;
+            }
+        }
+        if (alpha_v_static > 0.0f) {
+            alpha_v = alpha_v_static;
+        } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
+            alpha_v = fmaxf(0.98f, fminf(1.06f, 1.1484f - 0.01443f * ln_ctx));
+        } else if constexpr (type_V == GGML_TYPE_TURBO2_TCQ) {
+            alpha_v = fmaxf(1.00f, fminf(1.12f, 0.8865f + 0.0195f * ln_ctx));
+        }
+        CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_v_fattn, &alpha_v, sizeof(float)));
+
+        // K alpha: static (default 1.0, env var override)
+        static float alpha_k = -1.0f;
+        if (alpha_k < 0.0f) {
+            alpha_k = 1.0f;
+            const char * s = getenv("TURBO_TCQ_DECODE_ALPHA_K");
+            if (s) {
+                char * end;
+                float a = strtof(s, &end);
+                if (end != s && a > 0.0f && a < 10.0f) alpha_k = a;
+            }
+        }
+        CUDA_CHECK(cudaMemcpyToSymbol(d_tcq_decode_alpha_k_fattn, &alpha_k, sizeof(float)));
+    }
+
     // need_f16_K=false, need_f16_V=false: raw turbo data passes through to kernel.
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
@@ -86,18 +159,30 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     template void ggml_cuda_flash_attn_ext_mma_turbo_case                                            \
     <DKQ, DV, ncols1, ncols2, tK, tV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)            \
 
-// turbo4_0 matched K/V at D=128 and D=256. ncols2 ≤ 8.
-#define DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(DKQ, DV, ncols)                                                 \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/1, 1, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/2, 2, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/4, 4, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/8, 8, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0); \
+// Matched K/V at D=128 and D=256. ncols2 ≤ 8.
+#define DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, ncols, tK, tV)           \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/1, 1, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/2, 2, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/4, 4, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/8, 8, tK, tV); \
 
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(128, 128,  8)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(128, 128, 16)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(128, 128, 32)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(128, 128, 64)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(256, 256,  8)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(256, 256, 16)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(256, 256, 32)
-DECL_FATTN_MMA_TURBO4_CASE_ALL_NCOLS2(256, 256, 64)
+#define DECL_FATTN_MMA_TURBO_ALL(DKQ, DV, tK, tV) \
+    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV,  8, tK, tV) \
+    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, 16, tK, tV) \
+    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, 32, tK, tV) \
+    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, 64, tK, tV) \
+
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO8_0)
+// Asymmetric "q6 sweet spot" (6.124 bpw): turbo8 K + turbo4 V, D=256 only.
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO8_0,   GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO3_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO2_TCQ)
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_0,   GGML_TYPE_TURBO2_0)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_0,   GGML_TYPE_TURBO2_0)

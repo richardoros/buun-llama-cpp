@@ -19,6 +19,41 @@ static __constant__ float d_turbo_centroids_4bit_fattn[16] = {
      0.011353f,  0.034311f,  0.058069f,  0.083317f,
      0.111065f,  0.143047f,  0.182907f,  0.241556f,
 };
+// 8-bit codebook (uniform grid centroid[i]=(i-127.5)/127.5 in [-1,1], per-block absmax scale) for turbo8 dequant-to-f16
+static __constant__ float d_turbo_centroids_8bit_fattn[256] = {
+    -1.00000000f, -0.99215686f, -0.98431373f, -0.97647059f, -0.96862745f, -0.96078431f, -0.95294118f, -0.94509804f,
+    -0.93725490f, -0.92941176f, -0.92156863f, -0.91372549f, -0.90588235f, -0.89803922f, -0.89019608f, -0.88235294f,
+    -0.87450980f, -0.86666667f, -0.85882353f, -0.85098039f, -0.84313725f, -0.83529412f, -0.82745098f, -0.81960784f,
+    -0.81176471f, -0.80392157f, -0.79607843f, -0.78823529f, -0.78039216f, -0.77254902f, -0.76470588f, -0.75686275f,
+    -0.74901961f, -0.74117647f, -0.73333333f, -0.72549020f, -0.71764706f, -0.70980392f, -0.70196078f, -0.69411765f,
+    -0.68627451f, -0.67843137f, -0.67058824f, -0.66274510f, -0.65490196f, -0.64705882f, -0.63921569f, -0.63137255f,
+    -0.62352941f, -0.61568627f, -0.60784314f, -0.60000000f, -0.59215686f, -0.58431373f, -0.57647059f, -0.56862745f,
+    -0.56078431f, -0.55294118f, -0.54509804f, -0.53725490f, -0.52941176f, -0.52156863f, -0.51372549f, -0.50588235f,
+    -0.49803922f, -0.49019608f, -0.48235294f, -0.47450980f, -0.46666667f, -0.45882353f, -0.45098039f, -0.44313725f,
+    -0.43529412f, -0.42745098f, -0.41960784f, -0.41176471f, -0.40392157f, -0.39607843f, -0.38823529f, -0.38039216f,
+    -0.37254902f, -0.36470588f, -0.35686275f, -0.34901961f, -0.34117647f, -0.33333333f, -0.32549020f, -0.31764706f,
+    -0.30980392f, -0.30196078f, -0.29411765f, -0.28627451f, -0.27843137f, -0.27058824f, -0.26274510f, -0.25490196f,
+    -0.24705882f, -0.23921569f, -0.23137255f, -0.22352941f, -0.21568627f, -0.20784314f, -0.20000000f, -0.19215686f,
+    -0.18431373f, -0.17647059f, -0.16862745f, -0.16078431f, -0.15294118f, -0.14509804f, -0.13725490f, -0.12941176f,
+    -0.12156863f, -0.11372549f, -0.10588235f, -0.09803922f, -0.09019608f, -0.08235294f, -0.07450980f, -0.06666667f,
+    -0.05882353f, -0.05098039f, -0.04313725f, -0.03529412f, -0.02745098f, -0.01960784f, -0.01176471f, -0.00392157f,
+    0.00392157f, 0.01176471f, 0.01960784f, 0.02745098f, 0.03529412f, 0.04313725f, 0.05098039f, 0.05882353f,
+    0.06666667f, 0.07450980f, 0.08235294f, 0.09019608f, 0.09803922f, 0.10588235f, 0.11372549f, 0.12156863f,
+    0.12941176f, 0.13725490f, 0.14509804f, 0.15294118f, 0.16078431f, 0.16862745f, 0.17647059f, 0.18431373f,
+    0.19215686f, 0.20000000f, 0.20784314f, 0.21568627f, 0.22352941f, 0.23137255f, 0.23921569f, 0.24705882f,
+    0.25490196f, 0.26274510f, 0.27058824f, 0.27843137f, 0.28627451f, 0.29411765f, 0.30196078f, 0.30980392f,
+    0.31764706f, 0.32549020f, 0.33333333f, 0.34117647f, 0.34901961f, 0.35686275f, 0.36470588f, 0.37254902f,
+    0.38039216f, 0.38823529f, 0.39607843f, 0.40392157f, 0.41176471f, 0.41960784f, 0.42745098f, 0.43529412f,
+    0.44313725f, 0.45098039f, 0.45882353f, 0.46666667f, 0.47450980f, 0.48235294f, 0.49019608f, 0.49803922f,
+    0.50588235f, 0.51372549f, 0.52156863f, 0.52941176f, 0.53725490f, 0.54509804f, 0.55294118f, 0.56078431f,
+    0.56862745f, 0.57647059f, 0.58431373f, 0.59215686f, 0.60000000f, 0.60784314f, 0.61568627f, 0.62352941f,
+    0.63137255f, 0.63921569f, 0.64705882f, 0.65490196f, 0.66274510f, 0.67058824f, 0.67843137f, 0.68627451f,
+    0.69411765f, 0.70196078f, 0.70980392f, 0.71764706f, 0.72549020f, 0.73333333f, 0.74117647f, 0.74901961f,
+    0.75686275f, 0.76470588f, 0.77254902f, 0.78039216f, 0.78823529f, 0.79607843f, 0.80392157f, 0.81176471f,
+    0.81960784f, 0.82745098f, 0.83529412f, 0.84313725f, 0.85098039f, 0.85882353f, 0.86666667f, 0.87450980f,
+    0.88235294f, 0.89019608f, 0.89803922f, 0.90588235f, 0.91372549f, 0.92156863f, 0.92941176f, 0.93725490f,
+    0.94509804f, 0.95294118f, 0.96078431f, 0.96862745f, 0.97647059f, 0.98431373f, 0.99215686f, 1.00000000f,
+};
 
 // 3-bit TCQ codebook (product_mono/iter080, 512-state bitshift trellis). If you copy these, credit spiritbuun!
 // CUDA GLA product-aware training, 100 iters on Qwen3.5-27B FWHT-rotated KV activations. Decode: state_t = read_9_bits(qs, t*3)
@@ -1089,8 +1124,8 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(
     } else { static_assert(std::is_same_v<T, void>, "bad type"); }
 }
 
-// TCQ decode-time V alpha: mirrors d_tcq_decode_alpha_v from fattn.cu
-// When TURBO_TCQ_DECODE_ALPHA_V is set, this is loaded via fattn.cu's load_tcq_decode_alpha_fattn_common()
+// TCQ decode-time alphas: per-compilation-unit copies, set by cudaMemcpyToSymbol before kernel launch
+static __constant__ float d_tcq_decode_alpha_k_fattn = 1.0f;
 static __constant__ float d_tcq_decode_alpha_v_fattn = 1.0f;
 
 // TCQ 3-bit V dequant: 9-bit state → codebook lookup
@@ -1247,6 +1282,7 @@ static __global__ void flash_attn_mask_to_KV_max(
     if (tid < WARP_SIZE) {
         buf_iw[tid] = 1;
     }
+    ggml_cuda_pdl_sync();
     __syncthreads();
 
     int KV_max_sj = (ne30 - 1) * FATTN_KQ_STRIDE;
@@ -1299,6 +1335,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         const uint3 fd_iter_j_z,
         const uint3 fd_iter_j) {
     constexpr int ncols = ncols1*ncols2;
+    ggml_cuda_pdl_lc();
 
     const int tile_idx = blockIdx.x; // One block per output tile.
     const int j        = blockIdx.y;
@@ -1330,6 +1367,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
     dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
 
+    ggml_cuda_pdl_sync();
     // Load the partial result that needs a fixup
     float dst_val = *dst;
     float max_val;
@@ -1421,6 +1459,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     float dst_val = 0.0f;
     float max_val = 0.0f;
     float rowsum  = 0.0f;
+    ggml_cuda_pdl_sync();
     {
         dst_val = *dst;
 
@@ -1479,6 +1518,7 @@ static __global__ void flash_attn_combine_results(
         const float2 * __restrict__ VKQ_meta,
         float * __restrict__ dst,
         const int parallel_blocks) {
+    ggml_cuda_pdl_lc();
     // Dimension 0: threadIdx.x
     // Dimension 1: blockIdx.x
     // Dimension 2: blockIdx.y
@@ -1502,6 +1542,7 @@ static __global__ void flash_attn_combine_results(
     __builtin_assume(tid < D);
 
     extern __shared__ float2 meta[];
+    ggml_cuda_pdl_sync();
     for (int i = tid; i < 2*parallel_blocks; i += D) {
         ((float *) meta)[i] = ((const float *)VKQ_meta) [i];
     }
@@ -1758,7 +1799,9 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
-    fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
+
+        // disabled PDL enrollment for now due to a compiler bug.
+        fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
         (const char *) Q->data,
         K_data,
         V_data,
@@ -1788,9 +1831,9 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
-            flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>
-                <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
-                ((float *) KQV->data, dst_tmp_meta.ptr,
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
+                (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
         } else if (ntiles_dst % blocks_num.x != 0) {
@@ -1805,9 +1848,9 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
 
-            flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>
-                <<<blocks_num_combine, block_dim_combine, 0, main_stream>>>
-                ((float *) KQV->data, dst_tmp_meta.ptr,
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
+                (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
@@ -1816,9 +1859,9 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
-        flash_attn_combine_results<DV>
-            <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
-            (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
 }

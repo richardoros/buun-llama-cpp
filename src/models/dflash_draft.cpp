@@ -4,6 +4,88 @@
 #include <atomic>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// llama_model_dflash_draft — model class methods
+// ---------------------------------------------------------------------------
+
+void llama_model_dflash_draft::load_arch_hparams(llama_model_loader & ml) {
+    auto & hparams = this->hparams;
+
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,           hparams.dflash_block_size,        false);
+    ml.get_key(LLM_KV_DFLASH_MASK_TOKEN_ID,        hparams.dflash_mask_token_id,     false);
+    ml.get_key(LLM_KV_DFLASH_N_TARGET_FEATURES,    hparams.dflash_n_target_features, false);
+
+    {
+        const std::string key = ml.llm_kv(LLM_KV_DFLASH_TARGET_LAYER_IDS);
+        const int64_t kid = gguf_find_key(ml.metadata, key.c_str());
+        if (kid >= 0) {
+            const size_t n = gguf_get_arr_n(ml.metadata, kid);
+            hparams.dflash_n_target_layers = std::min((uint32_t) n, (uint32_t) 8);
+            const void * data = gguf_get_arr_data(ml.metadata, kid);
+            for (uint32_t i = 0; i < hparams.dflash_n_target_layers; ++i) {
+                hparams.dflash_target_layer_ids[i] = ((const uint32_t *) data)[i];
+            }
+        }
+    }
+
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+    if (hparams.n_swa > 0) {
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
+    }
+}
+
+void llama_model_dflash_draft::load_arch_tensors(llama_model_loader & ml) {
+    LLAMA_LOAD_LOCALS;
+
+    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+
+    dflash_fc          = create_tensor(tn(LLM_TENSOR_DFLASH_FC,          "weight"), {(int64_t) hparams.dflash_n_target_features, n_embd}, 0);
+    dflash_hidden_norm = create_tensor(tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd}, 0);
+
+    for (int i = 0; i < (int) hparams.n_layer; ++i) {
+        auto & layer = layers[i];
+
+        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0);
+        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
+
+        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa}, 0);
+        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v_gqa}, 0);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+
+        layer.ffn_norm      = create_tensor(tn(LLM_TENSOR_FFN_NORM,      "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+
+        // Recurrent layers (DeltaNet) — optional, probed by existence
+        layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", i), {0}, TENSOR_NOT_REQUIRED);
+        if (layer.ssm_conv1d) {
+            int64_t d_conv  = layer.ssm_conv1d->ne[0];
+            int64_t d_inner = layer.ssm_conv1d->ne[1];
+
+            layer.ssm_in   = create_tensor(tn(LLM_TENSOR_SSM_IN,   "weight", i), {n_embd, d_inner},     TENSOR_NOT_REQUIRED);
+            layer.ssm_out  = create_tensor(tn(LLM_TENSOR_SSM_OUT,  "weight", i), {d_inner / 2, n_embd}, TENSOR_NOT_REQUIRED);
+            layer.ssm_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {d_inner / 2},         TENSOR_NOT_REQUIRED);
+
+            GGML_UNUSED(d_conv);
+        }
+    }
+}
+
+std::unique_ptr<llm_graph_context> llama_model_dflash_draft::build_arch_graph(const llm_graph_params & params) const {
+    return std::make_unique<llm_build_dflash_draft>(*this, params);
+}
+
 // Max cross-attention context for DFlash drafter (caps VRAM growth).
 // Override with GGML_DFLASH_MAX_CTX env var. 0 = unlimited.
 static int64_t dflash_max_cross_ctx() {

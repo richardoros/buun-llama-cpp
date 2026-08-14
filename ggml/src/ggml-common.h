@@ -337,6 +337,16 @@ typedef struct {
 } block_turbo4_0;                       // 66 bytes total
 static_assert(sizeof(block_turbo4_0) == sizeof(ggml_half) + QK_TURBO4/2, "wrong turbo4_0 block size/padding");
 
+// TurboQuant 8-bit: uniform 256-level grid centroid[i]=(i-127.5)/127.5 + per-block absmax scale, no QJL.
+// Per block: norm(fp16) + 8-bit indices (128 bytes)
+// = 130 bytes per 128 values = 8.125 bits/value → Q8-class precision with FWHT outlier suppression.
+#define QK_TURBO8 128
+typedef struct {
+    ggml_half  norm;                    //   2 bytes: L2 norm for rescaling
+    uint8_t    qs[QK_TURBO8];           // 128 bytes: 8-bit codebook indices (1 per byte)
+} block_turbo8_0;                       // 130 bytes total
+static_assert(sizeof(block_turbo8_0) == sizeof(ggml_half) + QK_TURBO8, "wrong turbo8_0 block size/padding");
+
 //
 // Super-block quantization structures
 //

@@ -502,6 +502,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "turbo4") {
         return GGML_TYPE_TURBO4_0;
     }
+    if (s == "turbo8") {
+        return GGML_TYPE_TURBO8_0;
+    }
     if (s == "turbo3_tcq") {
         return GGML_TYPE_TURBO3_TCQ;
     }
@@ -2151,7 +2154,10 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
     GGML_ABORT("fatal error");
 }
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_bench(int argc, char ** argv);
+
+int llama_bench(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     // try to set locale for unicode characters in markdown
     std::setlocale(LC_CTYPE, ".UTF-8");
