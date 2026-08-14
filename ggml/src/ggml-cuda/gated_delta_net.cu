@@ -9,7 +9,7 @@
 #define GDN_EXPF(x) exp2f((x) * 1.442695041f)
 
 #if defined(GGML_USE_HIP)
-#define GGML_GDN_MIN_BLOCKS_PER_SM 2
+#define GGML_GDN_MIN_BLOCKS_PER_SM 1
 #else
 #define GGML_GDN_MIN_BLOCKS_PER_SM 2
 #endif
@@ -23,7 +23,8 @@ static bool gdn_fp16_state_enabled() {
 #endif
 }
 
-template <int S_v, bool KDA>
+
+template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, GGML_GDN_MIN_BLOCKS_PER_SM)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -47,6 +48,7 @@ gated_delta_net_cuda(const float * q,
                                      const uint3   neqk1_magic,
                                      const uint3   rq3_magic,
                                      float         scale,
+                                     int           K,
                                      bool          use_fp16) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -176,7 +178,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
                     const int i = r * warp_size + lane;
-                    curr_state[col * S_v + i] = s_shard[r];
+                    curr_state[col * S_v + i] = use_fp16 ? __half2float(__float2half(s_shard[r])) : s_shard[r];
                 }
             }
         }
@@ -184,10 +186,10 @@ gated_delta_net_cuda(const float * q,
 
     if constexpr (!keep_rs_t) {
 #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * warp_size + lane;
-        float val = s_shard[r];
-        state[col * S_v + i] = use_fp16 ? __half2float(__float2half(val)) : val;
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i          = r * warp_size + lane;
+            state[col * S_v + i] = use_fp16 ? __half2float(__float2half(s_shard[r])) : s_shard[r];
+        }
     }
 }
 
@@ -201,9 +203,8 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int K, cudaStream_t stream) {
+        float scale, int K, bool use_fp16, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
-    const bool use_fp16 = gdn_fp16_state_enabled();
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
@@ -220,26 +221,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, use_fp16);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K, use_fp16);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, use_fp16);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K, use_fp16);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, use_fp16);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K, use_fp16);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, use_fp16);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K, use_fp16);
             break;
         }
         default:
@@ -312,231 +313,28 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
     const int K = (int) src_state->ne[1];
     const bool keep_rs = K > 1;
+    const bool use_fp16 = gdn_fp16_state_enabled();
 
     if (kda) {
-        launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
-    } else {
-        launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
-    }
-}
-
-// ============================================================================
-// Tree-mode Gated Delta Net
-// ============================================================================
-
-#define GDN_TREE_ROOT_PARENT (-1)
-
-template <int S_v, bool KDA>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, GGML_GDN_MIN_BLOCKS_PER_SM)
-gated_delta_net_tree_cuda(const float * q,
-                          const float * k,
-                          const float * v,
-                          const float * g,
-                          const float * beta,
-                          const float * curr_state,
-                          const int32_t * parent_ids,
-                          half *        persist_inter,
-                          float *       dst,
-                          int64_t       H,
-                          int64_t       n_tokens,
-                          int64_t       n_seqs,
-                          int64_t       sq1,
-                          int64_t       sq2,
-                          int64_t       sq3,
-                          int64_t       sv1,
-                          int64_t       sv2,
-                          int64_t       sv3,
-                          int64_t       sb1,
-                          int64_t       sb2,
-                          int64_t       sb3,
-                          const uint3   neqk1_magic,
-                          const uint3   rq3_magic,
-                          float         scale,
-                          bool          use_fp16) {
-    const uint32_t h_idx    = blockIdx.x;
-    const uint32_t sequence = blockIdx.y;
-    const int      lane     = threadIdx.x;
-    const int      col      = blockIdx.z * blockDim.y + threadIdx.y;
-
-    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
-    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
-
-    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
-    float *       attn_data        = dst;
-    float *       state            = dst + attn_score_elems;
-
-    const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
-    state += state_offset;
-    curr_state += state_offset + col * S_v;
-    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
-
-    // parent_ids layout: [n_tokens] per sequence (flat, not per-seq for now)
-    const int32_t * parent_ids_seq = parent_ids;
-
-    // persist_inter layout: [S_v, S_v, H, n_tokens, n_seqs]
-    // For token t, head h: offset = ((seq * n_tokens + t) * H + h) * S_v * S_v
-    const int64_t inter_stride_token = H * S_v * S_v;
-    half * inter_seq_base = persist_inter + sequence * n_tokens * inter_stride_token;
-
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
-    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
-    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
-    float         s_shard[rows_per_lane];
-
-    // Load initial state
-#pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * warp_size + lane;
-        s_shard[r]  = use_fp16 ? __half2float(__float2half(curr_state[i])) : curr_state[i];
-    }
-
-    for (int t = 0; t < n_tokens; t++) {
-        // Tree branching: reload state from parent's intermediate if needed
-        if (t > 0) {
-            const int parent_t = parent_ids_seq[t];
-            if (parent_t == GDN_TREE_ROOT_PARENT) {
-                // Reload initial state (root token)
-#pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * warp_size + lane;
-        s_shard[r]  = use_fp16 ? __half2float(__float2half(curr_state[i])) : curr_state[i];
-    }
-            } else if (parent_t != t - 1) {
-                // Branch transition: load from parent's intermediate (f16 → f32)
-                const half * parent_inter = inter_seq_base + parent_t * inter_stride_token + h_idx * S_v * S_v;
-#pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
-                    s_shard[r] = __half2float(parent_inter[col * S_v + i]);
-                }
-            }
-            // else parent_t == t-1: sequential, state in registers is correct
-        }
-
-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
-
-        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
-        const float * beta_t = beta + gb_offset;
-        const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
-
-        const float beta_val = *beta_t;
-
-        float k_reg[rows_per_lane];
-        float q_reg[rows_per_lane];
-#pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
-        }
-
-        if constexpr (!KDA) {
-            const float g_val = GDN_EXPF(*g_t);
-
-            float kv_shard = 0.0f;
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                kv_shard += s_shard[r] * k_reg[r];
-            }
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
-
-            float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
-
-            float attn_partial = 0.0f;
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
-                attn_partial += s_shard[r] * q_reg[r];
-            }
-
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
-
-            if (lane == 0) {
-                attn_data[col] = attn_col * scale;
-            }
+        if (keep_rs) {
+            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, K, use_fp16, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, K, use_fp16, stream);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, K, use_fp16, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, K, use_fp16, stream);
         }
-
-        attn_data += S_v * H;
-    }
-
-    // Write final state (state after last token in DFS order)
-#pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * warp_size + lane;
-        float val = s_shard[r];
-        state[col * S_v + i] = use_fp16 ? __half2float(__float2half(val)) : val;
-    }
-}
-
-template <bool KDA>
-static void launch_gated_delta_net_tree(
-        const float * q_d, const float * k_d, const float * v_d,
-        const float * g_d, const float * b_d, const float * s_d,
-        const int32_t * parent_ids_d, half * persist_inter_d,
-        float * dst_d,
-        int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
-        int64_t sq1,   int64_t sq2, int64_t sq3,
-        int64_t sv1,   int64_t sv2, int64_t sv3,
-        int64_t sb1,   int64_t sb2, int64_t sb3,
-        int64_t neqk1, int64_t rq3,
-        float scale, cudaStream_t stream) {
-    const bool use_fp16 = gdn_fp16_state_enabled();
-    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int num_warps = 4;
-    dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
-    dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
-
-    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
-    const uint3 rq3_magic   = init_fastdiv_values(rq3);
-
-    switch (S_v) {
-        case 16:
-            gated_delta_net_tree_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, parent_ids_d, persist_inter_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, use_fp16);
-            break;
-        case 32:
-            gated_delta_net_tree_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, parent_ids_d, persist_inter_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, use_fp16);
-            break;
-        case 64:
-            gated_delta_net_tree_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, parent_ids_d, persist_inter_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, use_fp16);
-            break;
-        case 128:
-            gated_delta_net_tree_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, parent_ids_d, persist_inter_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, use_fp16);
-            break;
-        default:
-            GGML_ABORT("fatal error");
-            break;
     }
 }
 

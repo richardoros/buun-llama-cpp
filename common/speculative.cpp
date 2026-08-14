@@ -1810,12 +1810,6 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
         batch_dft = llama_batch_init(block_size, 0, 1);
 
-        // defer tape allocation to first draft() for VRAM savings during target prefill
-        const char * env_defer = getenv("GGML_DFLASH_DEFER_TAPE");
-        if (!env_defer || atoi(env_defer) != 0) {
-            llama_dflash_defer_tape(ctx_dft);
-        }
-
         // try to allocate GPU ring buffer on drafter's GPU
         gpu_ring_handle = llama_dflash_cross_ring_gpu_init(ctx_dft, n_target_layers, n_embd, ctx_window);
         if (gpu_ring_handle) {
@@ -2424,7 +2418,6 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_COPYSPEC:      return "copyspec";
         case COMMON_SPECULATIVE_TYPE_RECYCLE:       return "recycle";
         case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
-        case COMMON_SPECULATIVE_TYPE_MTP:           return "mtp";
         default:                                    return "unknown";
     }
 }
@@ -2895,9 +2888,6 @@ common_speculative * common_speculative_init(
         if (has_suffix) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_SUFFIX, params));
         }
-        if (has_mtp) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_MTP, params));
-        }
         if (has_dflash) {
             if (!has_copyspec) {
                 configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_COPYSPEC, params));
@@ -2947,19 +2937,6 @@ common_speculative * common_speculative_init(
                     config.type, n_seq, config.params.recycle_k));
                 LOG_INF("%s: token recycling speculative decoding (k=%d)\n",
                     __func__, config.params.recycle_k);
-                break;
-            }
-            case COMMON_SPECULATIVE_TYPE_MTP: {
-                int32_t n_mtp = llama_model_n_mtp_layers(llama_get_model(ctx_tgt));
-                if (n_mtp > 0) {
-                    llama_set_mtp_enabled(ctx_tgt, true);
-                    impls.push_back(std::make_unique<common_speculative_state_mtp>(
-                        config.type, ctx_tgt));
-                    LOG_INF("%s: MTP speculative decoding (depth=1, %d MTP layers, fused graph)\n",
-                        __func__, n_mtp);
-                } else {
-                    LOG_ERR("%s: MTP requested but model has no MTP layers\n", __func__);
-                }
                 break;
             }
             default:

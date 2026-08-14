@@ -3000,7 +3000,7 @@ private:
                 }
 
                 slot.n_tokens_before_draft = slot.prompt.n_tokens();
-                slot.mtp_kv_n_before_draft = llama_mtp_kv_n_used(ctx);
+                slot.mtp_kv_n_before_draft = llama_mtp_kv_n_used(ctx_tgt);
 
                 slot.spec_i_batch.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
@@ -4116,7 +4116,7 @@ private:
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
 
                             // MTP KV: rollback to pre-draft + accepted
-                            llama_mtp_kv_seq_rm(ctx, slot.mtp_kv_n_before_draft + (int) ids.size());
+                            llama_mtp_kv_seq_rm(ctx_tgt, slot.mtp_kv_n_before_draft + (int) ids.size());
 
                             const int n_reeval = slot.prompt.n_tokens() - n_past_before;
                             if (n_reeval > 0) {

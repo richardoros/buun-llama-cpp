@@ -254,7 +254,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     ggml_build_forward_expand(gf, cur);
 
     if (hparams.nextn_predict_layers > 0 && n_outputs == n_tokens && cparams.mtp_enabled) {
-        const int mtp_il = n_main_layers;
+        const int mtp_il = n_transformer_layers;
         const int64_t n_embd_head = hparams.n_embd_head_v();
         const int64_t n_head_q    = hparams.n_head();
         const int64_t n_head_kv   = hparams.n_head_kv();
